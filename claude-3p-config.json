@@ -4,15 +4,11 @@
   "inferenceGatewayApiKey": "PROXY_MANAGED",
   "inferenceModels": [
     {
-      "name": "deepseek-v4-pro",
+      "name": "claude-3-5-sonnet-20241022",
       "supports1m": true
     },
     {
-      "name": "mimo-v2.5",
-      "supports1m": true
-    },
-    {
-      "name": "claude-opus-4.7",
+      "name": "claude-3-5-haiku-20241022",
       "supports1m": true
     }
   ]
