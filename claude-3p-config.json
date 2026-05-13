@@ -1,0 +1,19 @@
+{
+  "inferenceProvider": "gateway",
+  "inferenceGatewayBaseUrl": "http://127.0.0.1:9999",
+  "inferenceGatewayApiKey": "PROXY_MANAGED",
+  "inferenceModels": [
+    {
+      "name": "deepseek-v4-pro",
+      "supports1m": true
+    },
+    {
+      "name": "mimo-v2.5",
+      "supports1m": true
+    },
+    {
+      "name": "claude-opus-4.7",
+      "supports1m": true
+    }
+  ]
+}

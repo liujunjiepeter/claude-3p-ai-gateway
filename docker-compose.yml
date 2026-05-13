@@ -1,0 +1,28 @@
+services:
+  one-api:
+    image: justsong/one-api:latest
+    platform: linux/amd64
+    container_name: one-api
+    restart: unless-stopped
+    ports:
+      - "${ONEAPI_PORT:-3000}:3000"
+    volumes:
+      - ./data/one-api:/data
+    environment:
+      - TZ=Asia/Shanghai
+
+  proxy:
+    image: python:3.13-alpine
+    container_name: anth-openai-proxy
+    restart: unless-stopped
+    ports:
+      - "${PROXY_PORT:-9999}:9999"
+    volumes:
+      - ./proxy.py:/proxy.py:ro
+    command: python3 /proxy.py 9999
+    environment:
+      - ONE_API_URL=http://one-api:3000
+      - PROXY_TOKEN=${ONEAPI_TOKEN:-your-one-api-token-here}
+      - MODELS=${MODELS}
+    depends_on:
+      - one-api
