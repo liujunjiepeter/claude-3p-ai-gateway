@@ -1,8 +1,8 @@
 """
-Anthropic → OpenAI protocol translation proxy.
+Anthropic → OpenAI protocol translation proxy (One-API Edition).
 Claude Code (Anthropic API) → this proxy → One-API (OpenAI API) → DeepSeek / Xiaomi
 """
-import json, os, sys, uuid
+import json, os, sys, uuid, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
@@ -14,123 +14,37 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests concurrently so count_tokens doesn't block messages."""
     daemon_threads = True
 
-# Models exposed via /v1/models — set MODELS env var as JSON array
-# Example: [{"id":"gpt-4o","type":"model","display_name":"GPT-4o"},...]
-MODELS = json.loads(os.environ.get(
-    "MODELS",
-    '[{"id":"deepseek-v4-pro","type":"model","display_name":"DeepSeek V4 Pro"},'
-    '{"id":"mimo-v2.5","type":"model","display_name":"MiMo V2.5"}]'
-))
+# ── 配置区 ────────────────────────────────────────────────────────
+
 ONE_API = os.environ.get("ONE_API_URL", "http://localhost:3000")
+# 填你在 One-API 后台生成的令牌
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "your-one-api-token-here")
 
+# 💡 名称映射表：接收客户端的伪装名，映射回真实模型名发给 One-API
+MODEL_MAPPING = {
+    "claude-3-5-sonnet-20241022": "deepseek-v4-pro",
+    "claude-3-5-haiku-20241022": "mimo-v2.5"
+}
 
-TEXT_ONLY_MODEL_HINTS = ("deepseek",)
+# 💡 暴露给客户端的模型 ID 必须符合官方白名单
+MODELS = [
+    {"id": "claude-3-5-sonnet-20241022", "type": "model", "display_name": "DeepSeek V4 Pro"},
+    {"id": "claude-3-5-haiku-20241022", "type": "model", "display_name": "MiMo V2.5"}
+]
 
-
-def _supports_vision(model: str) -> bool:
-    model_l = (model or "").lower()
-    return not any(hint in model_l for hint in TEXT_ONLY_MODEL_HINTS)
-
-
-def _content_to_text(content) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(item.get("text", ""))
-            elif isinstance(item, str):
-                parts.append(item)
-        return "\n".join(p for p in parts if p)
-    return json.dumps(content, ensure_ascii=False)
-
-
-def _downgrade_tool_message(msg: dict) -> dict:
-    tool_id = msg.get("tool_call_id", "") or "unknown"
-    content = _content_to_text(msg.get("content", ""))
-    if not content.strip():
-        content = "Task completed successfully (no output)."
-    return {"role": "user", "content": f"[工具结果 {tool_id}]\n{content}"}
-
-
-def _downgrade_assistant_tool_calls(msg: dict, reason: str) -> dict:
-    downgraded = dict(msg)
-    calls = downgraded.pop("tool_calls", []) or []
-    names = ", ".join(
-        (tc.get("function") or {}).get("name", "") for tc in calls if isinstance(tc, dict)
-    ) or "unknown"
-    content = _content_to_text(downgraded.get("content", ""))
-    suffix = f"[工具调用 {names} 已省略：{reason}]"
-    downgraded["content"] = f"{content}\n{suffix}".strip()
-    return downgraded
-
-
-def _sanitize_openai_messages(messages: list) -> list:
-    """Keep tool-call history valid for OpenAI-compatible APIs."""
-    sanitized = []
-    i = 0
-
-    while i < len(messages):
-        msg = messages[i]
-        role = msg.get("role")
-
-        if role == "tool":
-            sanitized.append(_downgrade_tool_message(msg))
-            i += 1
-            continue
-
-        if role == "assistant" and msg.get("tool_calls"):
-            expected = [
-                tc.get("id", "")
-                for tc in msg.get("tool_calls", [])
-                if isinstance(tc, dict) and tc.get("id")
-            ]
-            expected_set = set(expected)
-            tool_msgs = []
-            j = i + 1
-            while j < len(messages) and messages[j].get("role") == "tool":
-                tool_msgs.append(messages[j])
-                j += 1
-
-            found_set = {
-                tm.get("tool_call_id", "")
-                for tm in tool_msgs
-                if isinstance(tm, dict) and tm.get("tool_call_id")
-            }
-
-            if expected_set and expected_set.issubset(found_set):
-                sanitized.append(msg)
-                emitted = set()
-                for tm in tool_msgs:
-                    tool_id = tm.get("tool_call_id", "")
-                    if tool_id in expected_set and tool_id not in emitted:
-                        sanitized.append(tm)
-                        emitted.add(tool_id)
-                    else:
-                        sanitized.append(_downgrade_tool_message(tm))
-            else:
-                sanitized.append(_downgrade_assistant_tool_calls(msg, "历史中缺少匹配的工具结果"))
-                for tm in tool_msgs:
-                    sanitized.append(_downgrade_tool_message(tm))
-            i = j
-            continue
-
-        sanitized.append(msg)
-        i += 1
-
-    return sanitized
-
-
-# ── Anthropic → OpenAI request translation ──────────────────────────
+# ── 协议转换核心逻辑 ────────────────────────────────────────────────
 
 def anth_to_openai(body: dict) -> dict:
     """Convert Anthropic Messages request to OpenAI Chat Completions."""
-    model = body.get("model", "")
-    supports_vision = _supports_vision(model)
+    client_model = body.get("model", "")
+
+    # 偷梁换柱：获取真实的底层模型名
+    real_model = MODEL_MAPPING.get(client_model, client_model)
+
+    # 方言探测
+    is_reasoning_model = "deepseek" in real_model.lower() or "mimo" in real_model.lower()
+    supports_vision = "deepseek" not in real_model.lower()
+
     messages = body.get("messages", [])
     system = body.get("system", None)
     max_tokens = body.get("max_tokens", 4096)
@@ -155,10 +69,7 @@ def anth_to_openai(body: dict) -> dict:
                 if bt == "text":
                     text_parts.append(block.get("text", ""))
                 elif bt == "thinking":
-                    # Do not replay prior hidden reasoning into a different backend.
-                    # Several OpenAI-compatible providers reject reasoning_content in
-                    # input history, and it also bloats switch-time prompts.
-                    continue
+                    thinking_parts.append(block.get("thinking", ""))
                 elif bt == "image":
                     if not supports_vision:
                         text_parts.append("\n[系统提示：图片已由网关自动过滤，因为当前模型不支持视觉输入]")
@@ -184,49 +95,87 @@ def anth_to_openai(body: dict) -> dict:
                         content_val = "\n".join(parts) if parts else json.dumps(content_val)
                     elif not isinstance(content_val, str):
                         content_val = json.dumps(content_val)
+
                     if not content_val or content_val.strip() == "":
                         content_val = "Task completed successfully (no output)."
+
+                    # 💡 截断防卡死
+                    if len(content_val) > 15000:
+                        content_val = content_val[:15000] + "\n...[Warning: Output truncated by gateway to preserve KV Cache and token limits]..."
+
                     tool_results.append({
                         "tool_call_id": block.get("tool_use_id", ""),
                         "content": content_val,
                     })
 
-            reasoning_text = "\n".join(thinking_parts) or None
+            reasoning_text = "\n".join(thinking_parts) if thinking_parts else None
 
-            if role == "assistant" and tool_calls_oai:
-                msg = {"role": "assistant", "content": "\n".join(text_parts) or None, "tool_calls": tool_calls_oai}
+            if role == "assistant":
+                msg = {"role": "assistant"}
+                msg["content"] = "\n".join(text_parts) if text_parts else ""
+                if tool_calls_oai:
+                    msg["tool_calls"] = tool_calls_oai
+
+                # 针对推理模型强校验补齐推理字段
                 if reasoning_text:
                     msg["reasoning_content"] = reasoning_text
+                elif is_reasoning_model:
+                    msg["reasoning_content"] = ""
+
                 oai_messages.append(msg)
-            elif tool_results:
-                # Tool messages MUST come before user text (OpenAI validation)
+
+            elif role == "user":
+                # 工具结果必须剥离为独立的 tool 角色
                 for tr in tool_results:
                     oai_messages.append({"role": "tool", "tool_call_id": tr["tool_call_id"], "content": tr["content"]})
-                if text_parts:
-                    oai_messages.append({"role": "user", "content": "\n".join(text_parts)})
-            else:
-                content_val = "\n".join(text_parts)
-                if image_urls:
-                    content_val = [*[{"type": "text", "text": t} for t in text_parts], *image_urls]
-                msg = {"role": role, "content": content_val}
-                if role == "assistant" and reasoning_text:
-                    msg["reasoning_content"] = reasoning_text
-                oai_messages.append(msg)
+
+                if text_parts or image_urls:
+                    msg = {"role": "user"}
+                    if image_urls:
+                        msg["content"] = [{"type": "text", "text": t} for t in text_parts] + image_urls
+                    else:
+                        msg["content"] = "\n".join(text_parts)
+                    oai_messages.append(msg)
+
         else:
-            oai_messages.append({"role": role, "content": content})
+            msg = {"role": role, "content": content}
+            if role == "assistant" and is_reasoning_model:
+                msg["reasoning_content"] = ""
+            oai_messages.append(msg)
 
     if system:
+        sys_text = ""
         if isinstance(system, str):
-            oai_messages.insert(0, {"role": "system", "content": system})
+            sys_text = system
         elif isinstance(system, list):
             sys_text = "\n".join(b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text")
-            if sys_text:
-                oai_messages.insert(0, {"role": "system", "content": sys_text})
 
-    sanitized = _sanitize_openai_messages(oai_messages)
+        if sys_text:
+            # 💡 冻结时间：抹平动态时间戳，让模型命中前缀缓存！
+            sys_text = re.sub(r"Current time is.*?\n", "[Time frozen to preserve KV Cache]\n", sys_text, flags=re.IGNORECASE)
+            oai_messages.insert(0, {"role": "system", "content": sys_text})
+
+    # Sanitize: downgrade orphaned tool_calls
+    sanitized = []
+    i = 0
+    while i < len(oai_messages):
+        msg = oai_messages[i]
+        sanitized.append(msg)
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            expected = {tc["id"] for tc in msg["tool_calls"]}
+            found = set()
+            j = i + 1
+            while j < len(oai_messages) and oai_messages[j].get("role") == "tool":
+                found.add(oai_messages[j].get("tool_call_id", ""))
+                j += 1
+            if not expected.issubset(found):
+                names = ", ".join(tc["function"]["name"] for tc in msg["tool_calls"])
+                msg["content"] = (msg.get("content") or "") + f"\n[工具调用 {names} 未完成]"
+                del msg["tool_calls"]
+        i += 1
 
     oai_body = {
-        "model": model,
+        "model": real_model, # 💡 向 One-API 发送真实的模型名
         "messages": sanitized,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -249,7 +198,7 @@ def anth_to_openai(body: dict) -> dict:
         tool_choice = body.get("tool_choice")
         if tool_choice:
             if isinstance(tool_choice, dict) and tool_choice.get("type") == "any":
-                oai_body["tool_choice"] = "auto"
+                oai_body["tool_choice"] = "required"
             elif isinstance(tool_choice, dict) and tool_choice.get("type") == "tool":
                 oai_body["tool_choice"] = {"type": "function", "function": {"name": tool_choice.get("name", "")}}
 
@@ -371,28 +320,48 @@ def stream_anth_to_openai(body: dict):
                                 pinged = True
                         yield _event("content_block_delta", {"type": "content_block_delta", "index": block_idx, "delta": {"type": "text_delta", "text": content}})
 
-                    # Tool calls in delta
+                    # Tool calls in delta (含防挂起与断层修复)
                     for tc in (delta.get("tool_calls") or []):
                         idx = tc.get("index", 0)
+
                         if idx not in tool_states:
-                            if phase:
+                            if phase == "thinking":
                                 yield _event("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+                                block_idx += 1
+                                yield _event("content_block_start", {"type": "content_block_start", "index": block_idx, "content_block": {"type": "text", "text": "\n"}})
+                                yield _event("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+                            elif phase:
+                                yield _event("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+
                             block_idx += 1
                             phase = "tool_use"
-                            tool_states[idx] = {"id": tc.get("id") or "", "name": "", "args_str": ""}
+                            ts_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+                            tool_states[idx] = {"id": ts_id, "name": "", "args_str": "", "started": False}
+
                         ts = tool_states[idx]
                         if tc.get("id"):
                             ts["id"] = tc["id"]
+
                         fn = tc.get("function", {})
-                        if fn.get("name"):
+                        if fn.get("name") and not ts["name"]:
                             ts["name"] = fn["name"]
+
+                        if ts["name"] and not ts.get("started"):
                             yield _event("content_block_start", {"type": "content_block_start", "index": block_idx, "content_block": {"type": "tool_use", "id": ts["id"], "name": ts["name"], "input": {}}})
+                            ts["started"] = True
+
                         if fn.get("arguments"):
                             ts["args_str"] += fn["arguments"]
                             yield _event("content_block_delta", {"type": "content_block_delta", "index": block_idx, "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}})
 
                     finish = choice.get("finish_reason")
                     if finish:
+                        if phase == "thinking":
+                            yield _event("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+                            block_idx += 1
+                            yield _event("content_block_start", {"type": "content_block_start", "index": block_idx, "content_block": {"type": "text", "text": "\n"}})
+                            phase = "text"
+
                         yield from _emit_stream_close(phase, block_idx)
                         finished = True
 
@@ -413,8 +382,15 @@ def _emit_stream_close(phase: str, block_idx: int):
     ev = _close_current_block(phase, block_idx)
     if ev:
         yield ev
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 0}})}\n\n"
+    stop_reason = "tool_use" if phase == "tool_use" else "end_turn"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': 0}})}\n\n"
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+
+def _close_current_block(phase: str, block_idx: int):
+    if phase in ("thinking", "text", "tool_use"):
+        return _event("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+    return ""
 
 
 def _estimate_tokens(body: dict) -> int:
@@ -435,12 +411,6 @@ def _estimate_tokens(body: dict) -> int:
             if isinstance(b, dict) and b.get("type") == "text":
                 total += max(len(b.get("text", "")) // 3, 1)
     return max(total, 1)
-
-
-def _close_current_block(phase: str, block_idx: int):
-    if phase in ("thinking", "text", "tool_use"):
-        return _event("content_block_stop", {"type": "content_block_stop", "index": block_idx})
-    return ""
 
 
 # ── HTTP Handler ─────────────────────────────────────────────────────
@@ -483,17 +453,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid JSON body"}}).encode())
             return
-
-        msgs = body.get("messages", [])
-        last_user = ""
-        for m in reversed(msgs):
-            if m.get("role") == "user":
-                c = m.get("content", "")
-                if isinstance(c, list):
-                    c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
-                last_user = str(c)[:200]
-                break
-        sys.stderr.write(f"[proxy] model={body.get('model','?')} stream={body.get('stream')} tokens={body.get('max_tokens','?')} msgs={len(msgs)} last_user={last_user}\n")
 
         if body.get("stream"):
             self.send_response(200)
